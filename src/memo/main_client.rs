@@ -3,12 +3,10 @@ use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::os::fd::AsRawFd;
 use std::pin::Pin;
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use rustyline::error::ReadlineError;
-use rustyline::Editor;
+use futures::executor::block_on;
 use url::Url;
 
 use futures::{
@@ -34,15 +32,17 @@ use std::{
 };
 
 struct HttpGetFuture {
-    ed: Arc<EventDetector>,
     stream: TcpStream,
+    ev: Arc<EventDetector>,
     response: String,
     buf: [u8; 1024],
 }
 
 fn write_eventfd(fd: RawFd, n: usize) {
+    // usizeを*const u8に変換
     let ptr = &n as *const usize as *const u8;
     let val = unsafe { std::slice::from_raw_parts(ptr, std::mem::size_of_val(&n)) };
+    // writeシステムコール呼び出し
     write(fd, &val).unwrap();
 }
 
@@ -156,12 +156,14 @@ impl EventDetector {
         }
     }
 
+    // ファイルディスクリプタ登録用関数 <14>
     fn register(&self, flags: EpollFlags, fd: RawFd, waker: Waker) {
         let mut q = self.queue.lock().unwrap();
         q.push_back(EpollOps::ADD(flags, fd, waker));
         write_eventfd(self.event, 1);
     }
 
+    // ファイルディスクリプタ削除用関数 <15>
     fn unregister(&self, fd: RawFd) {
         let mut q = self.queue.lock().unwrap();
         q.push_back(EpollOps::REMOVE(fd));
@@ -170,7 +172,7 @@ impl EventDetector {
 }
 
 impl HttpGetFuture {
-    fn new(url: &Url, ed: Arc<EventDetector>) -> Self {
+    fn new(url: &Url, ev: Arc<EventDetector>) -> Self {
         let addr = url.socket_addrs(|| Some(8080)).unwrap();
         let mut stream =
             TcpStream::connect_timeout(addr.get(0).unwrap(), Duration::from_secs(5)).unwrap();
@@ -178,10 +180,9 @@ impl HttpGetFuture {
         stream
             .write_all(format!("GET {} HTTP/1.0\r\n\r\n", url.path()).as_bytes())
             .unwrap();
-        println!("request sent");
         HttpGetFuture {
-            ed,
             stream,
+            ev,
             response: String::new(),
             buf: [0; 1024],
         }
@@ -206,8 +207,9 @@ impl Future for HttpGetFuture {
                     self.response.push_str(&String::from_utf8_lossy(&a[..n]))
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // Non-blocking operation is not ready yet.
                     println!("Non-blocking operation is not ready yet.");
-                    self.ed.register(
+                    self.ev.register(
                         EpollFlags::EPOLLRDHUP | EpollFlags::EPOLLIN | EpollFlags::EPOLLONESHOT,
                         self.stream.as_raw_fd(),
                         cx.waker().clone(),
@@ -221,104 +223,18 @@ impl Future for HttpGetFuture {
     }
 }
 
-struct Task {
-    future: Mutex<BoxFuture<'static, ()>>,
-    sender: SyncSender<Arc<Task>>,
+fn http_get(url: &Url, ev: Arc<EventDetector>) -> HttpGetFuture {
+    HttpGetFuture::new(url, ev)
 }
 
-impl ArcWake for Task {
-    fn wake_by_ref(arc_self: &Arc<Self>) {
-        let self0 = arc_self.clone();
-        arc_self.sender.send(self0).unwrap();
-    }
-}
-
-struct Spawner {
-    sender: SyncSender<Arc<Task>>,
-}
-
-impl Spawner {
-    fn spawn(&self, future: impl Future<Output = ()> + 'static + Send) {
-        let future = future.boxed();
-        let task = Arc::new(Task {
-            future: Mutex::new(future),
-            sender: self.sender.clone(),
-        });
-        self.sender.send(task).unwrap();
-    }
-}
-
-struct Executor {
-    sender: SyncSender<Arc<Task>>,
-    receiver: Receiver<Arc<Task>>,
-}
-
-impl Executor {
-    fn new() -> Self {
-        let (sender, receiver) = sync_channel(1024);
-        Executor {
-            sender: sender.clone(),
-            receiver,
-        }
-    }
-
-    fn get_spawner(&self) -> Spawner {
-        Spawner {
-            sender: self.sender.clone(),
-        }
-    }
-
-    fn run(&self) {
-        println!("run");
-        while let Ok(task) = self.receiver.recv() {
-            println!("run...");
-            let mut future = task.future.lock().unwrap();
-            let waker = waker_ref(&task);
-            let mut ctx = Context::from_waker(&waker);
-            let _ = future.as_mut().poll(&mut ctx);
-        }
-    }
-}
-
-async fn http_request(url: Url, event_detector: Arc<EventDetector>) {
-    let res = HttpGetFuture::new(&url, event_detector).await;
-    println!("response: {}", res.unwrap());
+async fn aaa() {
+    let url = Url::parse("http://127.0.0.1:8080/index.html").unwrap();
+    let ev = EventDetector::new();
+    let http_get_future = http_get(&url, ev).await;
+    println!("res: {}", http_get_future.unwrap());
 }
 
 fn main() -> io::Result<()> {
-    let executor = Executor::new();
-    let event_detector = EventDetector::new();
-
-    let spawner = executor.get_spawner();
-    let mut rl = Editor::<()>::new().unwrap();
-
-    let exec_thread = std::thread::spawn(move || executor.run());
-    let req_thread = std::thread::spawn(move || loop {
-        match rl.readline(&format!("input request number: ")) {
-            Ok(line) => {
-                let line_trimed = line.trim();
-                if line_trimed.is_empty() {
-                    continue;
-                }
-
-                let input = line_trimed.parse::<i32>().unwrap();
-                // let input = 3;
-                for _ in 0..input {
-                    spawner.spawn(http_request(
-                        Url::parse("http://127.0.0.1:8080/index.html").unwrap(),
-                        event_detector.clone(),
-                    ));
-                }
-            }
-            Err(ReadlineError::Interrupted) => eprintln!("info: Ctrl+D to exit"),
-            Err(e) => {
-                eprintln!("info: failed to load\n{e}");
-                break;
-            }
-        }
-    });
-
-    req_thread.join().unwrap();
-    exec_thread.join().unwrap();
+    block_on(aaa());
     Ok(())
 }

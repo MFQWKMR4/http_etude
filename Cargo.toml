@@ -7,3 +7,8 @@ edition = "2021"
 
 [dependencies]
 futures = "0.3.17"
+url = "2.2.2"
+mio = "0.6.11"
+regex = "1"
+nix = "0.20.0"
+rustyline = "10.0"
