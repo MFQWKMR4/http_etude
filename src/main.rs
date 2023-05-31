@@ -7,6 +7,7 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use chrono::Local;
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
 use url::Url;
@@ -49,6 +50,11 @@ fn write_eventfd(fd: RawFd, n: usize) {
 enum EpollOps {
     ADD(EpollFlags, RawFd, Waker), // epollへ追加
     REMOVE(RawFd),                 // epollから削除
+}
+
+fn log_with_timestamp(message: &str) {
+    let timestamp = Local::now();
+    println!("[{}] {}", timestamp, message);
 }
 
 struct EventDetector {
@@ -98,7 +104,7 @@ impl EventDetector {
                 }
             }
         }
-        println!("add_event: {:?}", ev);
+        log_with_timestamp(&format!("add_event: {:?}", ev));
 
         assert!(!wakers.contains_key(&fd));
         wakers.insert(fd, waker);
@@ -126,11 +132,11 @@ impl EventDetector {
             &mut events,
             -1,
         ) {
-            println!("nfds: {}", nfds);
+            log_with_timestamp(&format!("nfds: {}", nfds));
             let mut t = self.wakers.lock().unwrap();
             for n in 0..nfds {
                 if events[n].data() == self.event as u64 {
-                    println!("eventfd");
+                    log_with_timestamp(&format!("eventfd"));
                     // eventfdの場合、追加、削除要求を処理 <12>
                     let mut q = self.queue.lock().unwrap();
                     while let Some(op) = q.pop_front() {
@@ -146,7 +152,7 @@ impl EventDetector {
                     let mut buf: [u8; 8] = [0; 8];
                     read(self.event, &mut buf).unwrap(); // eventfdの通知解除
                 } else {
-                    println!("not eventfd");
+                    log_with_timestamp(&format!("not eventfd"));
                     // 実行キューに追加 <13>
                     let data = events[n].data() as i32;
                     let waker = t.remove(&data).unwrap();
@@ -178,7 +184,7 @@ impl HttpGetFuture {
         stream
             .write_all(format!("GET {} HTTP/1.0\r\n\r\n", url.path()).as_bytes())
             .unwrap();
-        println!("request sent");
+        log_with_timestamp(&format!("request sent"));
         HttpGetFuture {
             ed,
             stream,
@@ -192,21 +198,21 @@ impl Future for HttpGetFuture {
     type Output = Result<String, Box<dyn Error>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
-        println!("poll");
+        log_with_timestamp(&format!("poll"));
         loop {
-            println!("|");
+            log_with_timestamp(&format!("|"));
             let mut a = self.buf.clone();
             match self.stream.read(&mut a) {
                 Ok(0) => {
-                    println!("break");
+                    log_with_timestamp(&format!("break"));
                     break;
                 }
                 Ok(n) => {
-                    println!("{}", n);
+                    log_with_timestamp(&format!("{}", n));
                     self.response.push_str(&String::from_utf8_lossy(&a[..n]))
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    println!("Non-blocking operation is not ready yet.");
+                    log_with_timestamp(&format!("Non-blocking operation is not ready yet."));
                     self.ed.register(
                         EpollFlags::EPOLLRDHUP | EpollFlags::EPOLLIN | EpollFlags::EPOLLONESHOT,
                         self.stream.as_raw_fd(),
@@ -269,9 +275,9 @@ impl Executor {
     }
 
     fn run(&self) {
-        println!("run");
+        log_with_timestamp(&format!("run"));
         while let Ok(task) = self.receiver.recv() {
-            println!("run...");
+            log_with_timestamp(&format!("run..."));
             let mut future = task.future.lock().unwrap();
             let waker = waker_ref(&task);
             let mut ctx = Context::from_waker(&waker);
@@ -282,7 +288,7 @@ impl Executor {
 
 async fn http_request(url: Url, event_detector: Arc<EventDetector>) {
     let res = HttpGetFuture::new(&url, event_detector).await;
-    println!("response: {}", res.unwrap());
+    log_with_timestamp(&format!("response: {}", res.unwrap()));
 }
 
 fn main() -> io::Result<()> {
